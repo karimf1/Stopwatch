@@ -19,11 +19,6 @@ an exhaustive walk over all 360,000 tenths of the counter's range.
 Range is `0:00:00.0` to `9:59:59.9`, then it wraps and latches a sticky
 `overflow` flag so the wrap is visible rather than silent.
 
-This is the second version. The first is kept at
-[`docs/stopwatch_draft_v1.v`](docs/stopwatch_draft_v1.v), and one of its bugs is
-still reproduced on demand by `make -C sim bug` -- see
-[The bug the testbench reproduces](#the-bug-the-testbench-reproduces).
-
 ## Quickstart
 
 ```bash
@@ -394,16 +389,3 @@ What is still true, named rather than hidden.
 - **`clr` while running zeroes and keeps counting.** That is a choice -- it makes
   `clr` a restart rather than a stop. For stop-and-zero, press start/stop first.
 
-## Repo layout
-
-```
-stopwatch/
-  rtl/      reset_sync.v  sync2.v  debounce.v  tick_gen.v  time_counter.v
-            lap_store.v   display_mux.v  seg_decode.v  stopwatch_top.v
-  boards/   de10_lite.v
-  tb/       tb_time_counter.v  tb_debounce.v  tb_lap_store.v
-            tb_no_reset.v  tb_stopwatch_top.v  tb_v1_phantom_lap.v
-  sim/      Makefile
-  docs/     stopwatch_draft_v1.v      the original, kept for `make bug`
-  README.md
-```
