@@ -1,160 +1,196 @@
 # stopwatch
 
 A 0.1-second-resolution stopwatch in Verilog-2001, driving six seven-segment
-displays directly, with a five-deep lap stack you can page back through on
-switches while the clock keeps running.
+displays directly, with a five-deep lap stack you can page back through while the
+clock keeps running.
 
-Five modules, 348 lines, no vendor IP and no SystemVerilog. Targets a 50 MHz
-board with six HEX displays and at least seven switch inputs — an Intel DE-series
-board is the obvious fit.
+Nine modules, 589 lines of RTL, one clock domain, no vendor IP and no
+SystemVerilog. Simulated with Icarus Verilog: 803 lines of testbench, including
+an exhaustive walk over all 360,000 tenths of the counter's range.
 
 ```
    +---+     +---+---+     +---+---+     +---+
-   | H |  :  | M | M |  :  | S | S |  .  | T |     6 x active-low 7-segment
+   | H |  .  | M | M |  .  | S | S |  .  | T |     6 x active-low 7-segment
    +---+     +---+---+     +---+---+     +---+
     0-9       0-5 0-9       0-5 0-9       0-9
    hours       minutes       seconds     tenths
 ```
 
-Display range is `0:00:00.0` to `9:59:59.9`, then it wraps to zero. There is no
-physical colon or decimal point — those are drawn above only to show the reading.
+Range is `0:00:00.0` to `9:59:59.9`, then it wraps and latches a sticky
+`overflow` flag so the wrap is visible rather than silent.
+
+This is the second version. The first is kept at
+[`docs/stopwatch_draft_v1.v`](docs/stopwatch_draft_v1.v), and one of its bugs is
+still reproduced on demand by `make -C sim bug` -- see
+[The bug the testbench reproduces](#the-bug-the-testbench-reproduces).
+
+## Quickstart
+
+```bash
+brew install icarus-verilog
+```
+
+```bash
+make -C sim
+```
+
+That lints the RTL and the board wrapper, then runs all five testbenches. Each
+prints `TEST PASSED` or the build exits nonzero.
+
+```bash
+make -C sim bug
+```
 
 ## Controls
 
 | input | type | effect |
 |---|---|---|
-| `reset` | active-high, async | clears the running time **and all five stored laps** |
-| `sw_start` | level | high = counting, low = paused. Not a toggle — the count runs while it is held high |
-| `sw_capture` | edge | on each 0→1 transition, pushes the current time onto the lap stack |
-| `sw0 .. sw4` | level | show stored lap 1..5 instead of the live time. Priority: `sw0` wins over `sw1`, and so on |
+| `reset` | async, active high | clears everything: time, laps, and the run state |
+| `btn_start_stop` | momentary | each press toggles between running and stopped |
+| `btn_lap` | momentary | each press pushes the current time onto the lap stack |
+| `clr` | level | holds time and laps at zero. Does **not** stop the count -- this is "restart", not "stop" |
+| `sw_view[i]` | level | show stored lap `i` instead of the live time. Lowest asserted index wins |
 
-Outputs are six independent 7-bit segment buses, one per digit — no display
-multiplexing, so the board needs six real seven-segment units:
-
-| output | digit | width |
-|---|---|---|
-| `hrs_display` | hours, 0-9 | `[6:0]` |
-| `mins_tens_display` / `mins_ones_display` | minutes, 00-59 | `[6:0]` each |
-| `secs_tens_display` / `secs_ones_display` | seconds, 00-59 | `[6:0]` each |
-| `ms_display` | tenths, 0-9 | `[6:0]` |
-
-With no `swN` asserted, the display shows live running time. Asserting one
-freezes the display on a stored lap **without stopping the counter** — the timer
+Viewing a lap freezes the display **without stopping the counter** -- the timer
 keeps advancing behind the switch, and dropping the switch snaps the display back
 to the current time. That separation of "what is being counted" from "what is
-being shown" is the design's one genuinely interesting idea, and it is the reason
-the lap stack lives in its own module rather than inside the counter.
+being shown" is the design's one genuinely interesting idea, and it is why the
+lap stack is its own module rather than something bolted into the counter.
+
+A slot that has never been written blanks the display rather than showing a
+plausible-looking `0:00:00.0`.
+
+| output | meaning |
+|---|---|
+| `hrs_display`, `mins_tens_display`, `mins_ones_display`, `secs_tens_display`, `secs_ones_display`, `tenths_display` | one `[6:0]` active-low segment bus per digit |
+| `running` | counting |
+| `overflow` | sticky: has wrapped past 9:59:59.9 |
+| `viewing_lap`, `view_index[2:0]` | a lap is on the display, and which slot it came from |
 
 ## Block diagram
 
-```
-                    +--------------------+
-                    | clock_dividermain  |  23-bit counter + toggle FF
-                    | / 5,000,000        |  50 MHz -> 10.000 Hz, 50% duty
-                    +--------------------+
-                              | clk_10hz
-                              v
-                    +--------------------+
-                    | time_counter_dec   | <-- sw_start (enable)
-                    | 10 / 60 / 60 / 10  |
-                    +--------------------+
-                              |
-                              |  live time: hrs mins secs ms
-              +---------------+-------------------+
-              |                                   |
-              v                                   |
-     +--------------------+                       |
-     | storage_values     | <-- sw_capture        |
-     | 20 ms debounce     |                       |
-     | rising-edge pulse  |                       |
-     | 5-deep lap stack   |                       |
-     +--------------------+                       |
-              |                                   |
-              |  5 stored laps                    |
-              +---------------+-------------------+
-                              |
-                              v
-                    +--------------------------+
-     sw0..sw4 ----> | display_stored           |
-                    | 6-way priority mux       |
-                    | /10 and %10 digit split  |
-                    +--------------------------+
-                              |
-                              |  6 x 4-bit BCD
-                              v
-                    +--------------------------+
-                    | bcd_display  x 6         |
-                    | case ROM, active low     |
-                    +--------------------------+
-                              |
-                              v
-                     HEX5 HEX4 ... HEX0
+Everything below runs on `clk`. There is no second clock.
 
-     clock domains:  clk_10hz drives time_counter_dec only.
-                     Everything else runs on the 50 MHz clk.
+```
+                    reset ---> reset_sync ---> rst   (used synchronously below)
+
+           btn_start_stop ---> debounce ---> rise ---> run toggle FF ---> running
+                  btn_lap ---> debounce ---> rise ---> push
+                      clr ---> sync2    ---> clr_s
+             sw_view[4:0] ---> sync2 x5 ---> sel[4:0]
+
+                                  running
+                                     |  restart on the press that starts it
+                                     v
+                          +----------------------+
+                          | tick_gen             |
+                          | / 5,000,000          |
+                          +----------------------+
+                                     | tick   one clk wide, 10 Hz
+                                     v
+                          +----------------------+
+                          | time_counter         | <--- clr_s
+                          | 6 BCD digits         |
+                          +----------------------+
+                                     | live [23:0]
+              +----------------------+---------------------+
+              |                                            |
+              v                                            |
+   +----------------------+                                |
+   | lap_store            | <--- push, clr_s               |
+   | 5 x 24 bits + valid  |                                |
+   +----------------------+                                |
+              | laps, valid                                |
+              +----------------------+---------------------+
+                                     |
+                                     v
+                          +--------------------------+
+             sel[4:0] --->| display_mux              |
+                          | priority, blank-if-empty |
+                          +--------------------------+
+                                     | 6 x 4-bit BCD
+                                     v
+                          +--------------------------+
+                          | seg_decode  x 6          |
+                          +--------------------------+
+                                     |
+                                     v
+                              HEX5  ...  HEX0
 ```
 
 ## How it works
 
-### clock_dividermain — 50 MHz to 10 Hz
+### tick_gen -- a strobe, not a divided clock
 
-A 23-bit counter and a toggle flip-flop. The counter runs `0 .. 2_499_999`, so
-`clk_10hz` inverts every 2,500,000 input cycles and its full period is 5,000,000
-cycles. At 50 MHz that is exactly 10.000 Hz with a 50% duty cycle — one tick per
-tenth of a second, which is the timebase everything else is built on.
+The counter is not clocked by a divided clock. `tick_gen` emits a **one-cycle
+enable pulse** every `CLK_HZ / TICK_HZ` cycles, and `time_counter` runs on the
+full-rate `clk` with that pulse as its enable.
 
-The 50 MHz figure is *implicit in that constant*, not a parameter. Feeding this
-design a 100 MHz clock silently makes the stopwatch run at half speed.
+This is the central change from v1 and it fixes three things at once: the design
+becomes single-clock so the lap-capture clock-domain crossing stops existing, no
+derived-clock constraint is needed for timing analysis, and every flop stays on
+the global clock network instead of hanging off a routed logic output.
 
-### time_counter_dec — cascaded mod-N counters
+`restart` zeroes the divider phase, and the top level pulses it on the press that
+*starts* the stopwatch. Without that, the first tenth would represent somewhere
+between 0 and 100 ms of real elapsed time, depending on where a free-running
+divider happened to be.
 
-Four counters chained so each rolls the next over, clocked by `clk_10hz`:
+### time_counter -- BCD digits, no division
 
-```
-ms 0..9  --carry-->  secs 0..59  --carry-->  mins 0..59  --carry-->  hrs 0..9
-(tenths)                                                                    |
-                                                              wraps to 0 <--+
-```
-
-`enable` gates the whole chain. When it is low every register holds — there is no
-`else` clause, so pause is implemented as the absence of an assignment rather
-than a feedback mux, which synthesizes to the flip-flop's own clock enable.
-
-Note that `ms` counts **tenths of a second**, not milliseconds. The name is the
-one piece of the interface that lies about what it does.
-
-### storage_values — debounce, edge detect, lap stack
-
-Three things in one module, all clocked by the fast 50 MHz `clk`.
-
-**The debouncer is an integrator, not a timer.** It only counts while the raw
-input disagrees with the currently accepted value, and any bounce back to that
-value resets the count to zero:
+Six 4-bit digits, each already in the form its decoder wants:
 
 ```
-sw_capture == sw_stable  ->  db_count <= 0
-sw_capture != sw_stable  ->  db_count <= db_count + 1
-db_count == 999_999      ->  sw_stable <= sw_capture,  db_count <= 0
+tenths 0..9 --carry--> secs 0..59 --carry--> mins 0..59 --carry--> hrs 0..9
+                                                                       |
+                                                         wraps to 0 <--+
 ```
 
-So the input has to hold its new state *continuously* for 1,000,000 cycles — 20 ms
-at 50 MHz — before it is believed. That is the right structure: a plain "wait
-20 ms then sample" timer can be fooled by a bounce train that happens to be
-settled at the moment of sampling.
+v1 kept seconds and minutes as 0-59 binary and split them for display with
+`/ 10` and `% 10`. Counting in BCD deletes that arithmetic entirely.
 
-**The edge detector** is one delay register plus an AND:
+The carries are combinational ANDs off the digit-at-max comparisons, so this is
+not a ripple counter: every digit updates on the same clock edge, and the chain
+is one cycle deep rather than six.
 
 ```verilog
-sw_stable_prev <= sw_stable;
-assign capture_pulse = (sw_stable && !sw_stable_prev);
+wire c_t  = tick & run;
+wire c_so = c_t  & t_max;
+wire c_st = c_so & so_max;
+wire c_mo = c_st & st_max;
+wire c_mt = c_mo & mo_max;
+wire c_h  = c_mt & mt_max;
+wire wrap = c_h  & h_max;
 ```
 
-One `clk`-wide pulse on press. Releasing does nothing, and holding the button
-down does not repeat — one press, one lap.
+Pause is the absence of an assignment rather than a feedback mux, which
+synthesizes to the flip-flop's own clock enable. `wrap` latches the sticky
+`overflow` output.
 
-**The lap stack is a shift register**, five entries deep and 20 bits wide per
-entry (4+6+6+4), so 100 flip-flops in all. On `capture_pulse` everything shifts
-down one slot and the live time lands in slot 0:
+### debounce -- synchronize, integrate, detect
+
+One reusable module, instantiated twice, replacing the debouncer v1 had
+hand-inlined into its lap store.
+
+The debouncer is an **integrator, not a timer**. The counter only runs while the
+raw input disagrees with the currently accepted level, and any bounce back to
+that level restarts it from zero, so the input must hold its new state
+*continuously* for `DEBOUNCE_MS`. A plain "wait 20 ms then sample" timer can be
+fooled by a bounce train that happens to be settled at the sampling instant; this
+cannot. `tb_debounce` checks that with 12-cycle bounce trains on both edges.
+
+Two details that are not decoration:
+
+**The input goes through a `sync2` first**, so no asynchronous pin ever reaches a
+flop directly.
+
+**Out of reset, `level` loads the synchronized pin rather than 0.** That single
+line is what stops a button already held down at reset release from looking like
+a fresh press. v1 got this wrong and captured a lap nobody asked for.
+
+### lap_store -- indexed array behind a flat port
+
+Same shift-stack idea as v1, newest in slot 0, oldest falling off the end:
 
 ```
                        lap0      lap1      lap2      lap3      lap4
@@ -166,190 +202,208 @@ down one slot and the live time lands in slot 0:
                                                      lap #1 has fallen off the end
 ```
 
-The stack keeps the five *most recent* laps and silently discards older ones.
-Because all five shifts are non-blocking assignments in one `always` block, they
-happen simultaneously off the same edge — this is the standard idiom, and writing
-it with blocking assignments would collapse the whole stack to one value.
+Written as an indexed array with a `for` loop instead of twenty hand-written
+assignments. Every right-hand side reads the pre-edge value, so all five slots
+move simultaneously -- the standard non-blocking idiom, and the reason this
+cannot be written with blocking assignments.
 
-### display_stored — priority mux and digit split
+Verilog-2001 cannot pass an unpacked array through a port, so the stack is
+flattened into one vector and sliced with a constant-width part select
+(`laps[i*TW +: TW]`). That is the portable alternative to v1's twenty separate
+ports.
 
-A combinational `if / else if` chain selects one of six sources (five laps, or
-the live time as the fall-through), which synthesizes to a priority mux. Then the
-two-digit fields are split for display:
+A `valid` bitmap tracks which slots hold real captures, so an empty slot can
+blank rather than read as `0:00:00.0`.
 
-```verilog
-wire [3:0] mins_tens = mins_out / 10;
-wire [3:0] mins_ones = mins_out % 10;
-```
+### display_mux and seg_decode
 
-Division by a constant is synthesizable — the tool turns it into a shift-and-add,
-not a real divider — but it is still arithmetic that does not need to exist. See
-[Improvements](#improvements).
+`display_mux` runs its selection loop **downwards**, so slot 0 is assigned last
+and therefore wins -- same priority as v1's `if / else if` chain, but off a bus,
+so lap depth costs no source lines.
 
-### bcd_display — active-low segment decoder
-
-A `case` statement over 4 bits, which infers a small combinational ROM. The
-encoding is active-low with bit order `{g, f, e, d, c, b, a}`:
+`seg_decode` keeps v1's active-low encoding, bit order `{g,f,e,d,c,b,a}`, with a
+`blank` input added:
 
 | value | `seg[6:0]` | lit segments |
 |---|---|---|
 | 0 | `1000000` | a b c d e f |
 | 1 | `1111001` | b c |
 | 8 | `0000000` | all |
-| default | `1111111` | blank |
+| blank / default | `1111111` | none |
 
-Active-low means these are common-anode displays, which is what the HEX outputs
-on Intel DE boards expect. The `default` branch blanks the digit — inputs above 9
-cannot occur given the counter ranges, but the branch is there so the case is
-full and no latch is inferred.
+`tb_stopwatch_top` decodes these patterns back into digits and checks the reading
+end to end, so the display path is verified rather than assumed.
+
+### de10_lite -- board wrapper
+
+Board polarity and pin names are kept out of the core. `KEY[1:0]` are active-low
+momentary buttons and get inverted here; `SW[9]` is reset, `SW[8]` is clear,
+`SW[4:0]` select laps.
+
+The DE10-Lite HEX ports are 8 bits -- `[6:0]` segments plus `[7]` decimal point
+-- so three decimal points are lit permanently as the field separators v1 had no
+way to drive:
+
+```
+        H . M M . S S . T
+        ^       ^     ^
+    HEX5[7] HEX3[7] HEX1[7]
+```
 
 ## Methods used
 
-Named plainly, since this is what the project is a demonstration of:
-
 | technique | where |
 |---|---|
-| Clock division by counter + toggle FF | `clock_dividermain` |
-| Cascaded mod-N counters with roll-over carry | `time_counter_dec` |
-| Clock-enable gating for pause (no feedback mux) | `time_counter_dec` |
-| Integrating switch debouncer | `storage_values` |
-| Rising-edge detection via delay register | `storage_values` |
-| Shift-register history buffer (FIFO-like stack) | `storage_values` |
-| Priority multiplexer from an `if/else if` chain | `display_stored` |
-| Combinational ROM via full `case` | `bcd_display` |
-| Structural hierarchy — five modules, one top-level integrator | `stopwatch_draft` |
-| Asynchronous active-high reset throughout | all sequential modules |
-| Blocking `=` in `always @(*)`, non-blocking `<=` in clocked blocks | throughout |
+| Clock-enable strobe generation (single clock domain) | `tick_gen` |
+| Divider phase alignment to an event | `tick_gen`, `stopwatch_top` |
+| Cascaded BCD counters with look-ahead carry | `time_counter` |
+| Clock-enable gating for pause (no feedback mux) | `time_counter` |
+| Async-assert / sync-deassert reset synchronizer | `reset_sync` |
+| Two-flop CDC synchronizer on every async input | `sync2` |
+| Integrating switch debouncer | `debounce` |
+| Rising/falling edge detection via delay register | `debounce` |
+| Toggle flip-flop for run state | `stopwatch_top` |
+| Shift-register history buffer with a valid bitmap | `lap_store` |
+| Array-behind-flat-port for Verilog-2001 array ports | `lap_store` |
+| Priority multiplexer from a reverse-order loop | `display_mux` |
+| Combinational ROM via full `case` | `seg_decode` |
+| Parameterized design with derived timing constants | throughout |
+| Board wrapper isolating pin polarity from the core | `de10_lite` |
 
 ## Numbers
 
+At the default `CLK_HZ = 50_000_000`:
+
 | quantity | value | derivation |
 |---|---|---|
-| assumed input clock | 50 MHz | implied by the divider constant |
-| tick rate | 10.000 Hz | 50 MHz / 5,000,000 |
+| tick rate | 10.000 Hz | `CLK_HZ / TICK_HZ` = one tick per 5,000,000 cycles |
 | resolution | 100 ms | one tick |
-| full-scale range | 9:59:59.9 | then wraps to 0:00:00.0 |
-| debounce window | 20 ms | 1,000,000 cycles @ 50 MHz |
-| capture pulse width | 20 ns | one `clk` cycle |
-| lap stack | 5 x 20 bits | 100 flip-flops |
+| full-scale range | 9:59:59.9 | then wraps, `overflow` latches |
+| debounce window | 20 ms | `(CLK_HZ/1000) * 20` = 1,000,000 cycles |
+| divider counter | 23 bits | `clog2(5,000,000)` |
+| debounce counter | 20 bits | `clog2(1,000,000)` |
+| lap stack | 5 x 24 bits | 120 flops plus a 5-bit valid mask |
 | display digits | 6 | H MM SS T |
+| flip-flops | ~240 | hand count from the source, not a synthesis report |
+
+Every interval is derived from `CLK_HZ`. Porting to a 100 MHz board is one
+parameter, and the testbenches drop it to 1,000 or 10,000 so a tick costs
+hundreds of cycles instead of five million.
+
+## Verification
+
+589 lines of RTL, 803 lines of testbench. Plain Verilog has no `assert` and no
+classes, so the checkers are ordinary tasks and `always` blocks.
+
+| testbench | what it establishes |
+|---|---|
+| `tb_time_counter` | **360,030 checks.** Walks all 360,000 tenths from `0:00:00.0` to `9:59:59.9` and past the wrap, comparing every value against an independently written model. Also: ticks ignored while paused, one advance per tick and not per clock, value frozen across 200 clocks while paused, resume from the paused value, `clr`, and that `overflow` latches exactly at the wrap and is sticky |
+| `tb_debounce` | clean press and release, a glitch shorter than the window ignored, 12-cycle bounce trains on both edges producing exactly one edge each, single-cycle pulse width, and **a button held across reset release producing no edge** |
+| `tb_lap_store` | shift order, a sixth push dropping the oldest, all five slots moving together, the `valid` bitmap filling and saturating, hold when `push` is low, `clr`, and `clr` winning over a simultaneous `push` |
+| `tb_no_reset` | the whole design powers up defined and counts correctly **with `reset` tied low for the entire simulation** |
+| `tb_stopwatch_top` | button semantics end to end: one press starts, a second stops, the value freezes, laps capture while stopped, viewing a lap does not stop the count, the display snaps back on release, an unwritten slot blanks, switch priority, `clr` zeroing time and laps while leaving the stopwatch running, reset stopping it -- plus the segment patterns decoded back into digits, and a measurement that the first tick lands **exactly** one divider period after the start press |
+
+The exhaustive counter walk is the one worth pointing at. Roll-over bugs live at
+`9.9 -> 10.0`, `59.9 -> 1:00.0` and `9:59:59.9 -> 0:00:00.0`, and checking all
+360,000 values against a model rather than spot-checking three of them means
+there is nowhere for an off-by-one to hide.
+
+## The bug the testbench reproduces
+
+`make -C sim bug` builds v1's `storage_values` and v2's `debounce` side by side,
+holds the capture button down across reset release, and then does nothing:
+
+```
+Capture button held down across reset release.
+Nobody presses anything after that.
+
+v1 storage_values : lap slot 0 = 3:25:45.6
+v2 debounce       : rise pulses = 0
+
+   v1 stored a lap nobody asked for.  Bug reproduced.
+   v2 produced no edge.  Fix confirmed.
+```
+
+v1 resets `sw_stable` to 0. If the button is physically down at that moment, the
+debouncer sees a disagreement, counts out its 20 ms, adopts 1, and the edge
+detector reports a rising edge -- a press that never happened. The fix is one
+line: load the synchronized pin at reset instead of a constant.
+
+The testbench fails if v1 *stops* showing the bug, so the demonstration cannot
+quietly rot into a test of nothing.
+
+## What changed from v1
+
+Every drawback named in the previous version of this README, and what happened to
+it.
+
+| v1 drawback | fix | verified by |
+|---|---|---|
+| `clk_10hz` was a fabric-generated clock | `tick_gen` emits a clock-enable strobe; single clock domain | `tb_stopwatch_top` |
+| Lap capture crossed a clock domain unsynchronized | crossing no longer exists -- counter and lap stack share `clk` | structural |
+| Nothing worked in simulation until `reset` was pulsed | declaration initializers on every register | `tb_no_reset` |
+| No reset synchronizer | `reset_sync`: async assert, sync deassert, minimum width guarantee | structural |
+| Async inputs went straight into logic | `sync2` on every pin, including all five view switches | `tb_debounce` |
+| Held `sw_capture` across reset fired a spurious lap | debouncer loads the synchronized pin out of reset | `tb_debounce`, `make bug` |
+| Start/stop was a level, needed a slide switch | debounce + edge + toggle flip-flop; works with a push button | `tb_stopwatch_top` |
+| `reset` was the only way to clear laps | `clr` zeroes time and laps without stopping the count | `tb_stopwatch_top` |
+| `/ 10` and `% 10` in the display path | counter holds BCD digits directly | `tb_time_counter` |
+| 5 switch ports + 20 lap ports | `sw_view[4:0]` bus, flat lap vector, indexed array | -- |
+| `display_stored` had an unused `clk` port | gone; `display_mux` is purely combinational | lint |
+| Multiple switches on gave no indication of which lap | `viewing_lap` and `view_index[2:0]` outputs | `tb_stopwatch_top` |
+| An empty lap slot displayed as `0:00:00.0` | `valid` bitmap blanks unwritten slots | `tb_stopwatch_top` |
+| Hard-coded `2_499_999` and `999_999` | everything derived from `CLK_HZ` | testbenches override it |
+| A 10-hour wrap was indistinguishable from a fresh start | sticky `overflow` output | `tb_time_counter` |
+| `ms` port name meant tenths, not milliseconds | renamed `tenths_display` | -- |
+| No decimal point control | three DPs lit as field separators in the board wrapper | -- |
+| No leading-zero blanking | `LZ_BLANK` parameter, **default off** -- see below | -- |
+| Five modules in one file | nine modules, one per file, plus `tb/` and `sim/` | -- |
+| No testbench | five testbenches, 803 lines | -- |
+
+One of those is a deliberate non-fix. **Leading-zero blanking is implemented but
+off by default**, because a stopwatch is easier to read in a fixed `H:MM:SS.T`
+field than with digits appearing and disappearing as it counts. It is offered as
+a parameter rather than imposed.
 
 ## Known limitations
 
-Named rather than hidden. These are properties of the design as written, not
-speculation.
+What is still true, named rather than hidden.
 
-- **Nothing works in simulation until `reset` is pulsed.** `clk_10hz`,
-  `db_count` and `sw_stable` have no reset-independent initial value, so they
-  start as `X`. `clk_10hz <= ~clk_10hz` on an `X` stays `X` forever, and
-  `db_count + 1` on an `X` never reaches the compare value. On a real FPGA the
-  power-up state saves this; a testbench must assert reset first.
-- **`clk_10hz` is a fabric-generated clock, not a clock-enable.** It comes off a
-  logic flip-flop, not a global clock buffer, so it picks up routing skew and
-  needs an explicit derived-clock constraint for timing analysis. This is the
-  single biggest structural criticism of the design.
-- **The lap capture crosses a clock domain unsynchronized.** `time_counter_dec`
-  runs on `clk_10hz`; `storage_values` samples its 20-bit output on the 50 MHz
-  `clk`. If `capture_pulse` lands inside the setup/hold window of a `clk_10hz`
-  edge, some bits can be captured before the tick and others after — a stored lap
-  of `1:59.9` becoming `2:59.9`. The odds are roughly one 20 ns window per 100 ms
-  tick, so about 2 in 10 million per capture: rare enough to never show up in
-  testing, real enough to be wrong.
-- **No reset synchronizer.** Reset is asserted asynchronously and released
-  asynchronously, so different flip-flops can leave reset on different cycles.
-- **`sw_start`, `sw_capture` and `sw0..sw4` go straight into logic.** No two-flop
-  synchronizer on any asynchronous input. The debouncer masks most of the risk on
-  `sw_capture`, and `sw0..sw4` are purely combinational so the worst case is a
-  flickering digit, but `sw_start` is sampled by a flip-flop and can go
-  metastable.
-- **A held `sw_capture` across reset release fires a spurious lap.** Reset forces
-  `sw_stable` to 0; if the button is already down, the debouncer times out 20 ms
-  later and captures `0:00:00.0`.
-- **`reset` is the only way to clear laps.** There is no separate lap-clear, so
-  clearing history necessarily throws away the running time too.
-- **Start/stop is a level, not a toggle.** `sw_start` must be a slide switch. Wire
-  a momentary push-button to it and the stopwatch only runs while your finger is
-  on it.
-- **Hours is a single digit.** The counter wraps at 10 hours with no carry-out and
-  no overflow flag, so a wrap is indistinguishable from a fresh start.
-- **`display_stored` has an unused `clk` port.** It is entirely combinational.
-  Lint will flag it.
-- **Multiple `swN` switches on at once is not an error.** Priority silently picks
-  the lowest-numbered one; there is no indication which lap you are looking at.
-- **No leading-zero blanking** and no decimal point control — `0:00:03.7` shows a
-  literal leading `0:00`.
-- **No testbench.** None of the above is verified by anything but inspection.
-
-## Improvements
-
-Roughly in order of how much they are worth doing.
-
-**1. Replace the divided clock with a clock-enable strobe.** Have
-`clock_dividermain` emit a one-cycle `tick_10hz` pulse instead of a 10 Hz square
-wave, and clock `time_counter_dec` on the 50 MHz `clk` with `tick_10hz` as its
-enable. This is a small edit that fixes three problems at once: the whole design
-becomes single-clock, the clock-domain-crossing bug on lap capture disappears
-entirely because the counter and the lap stack now share a clock, and timing
-analysis stops needing a derived-clock constraint. If only one thing on this list
-gets done, it should be this one.
-
-**2. Write a testbench.** Icarus Verilog is free and the design is small enough
-to verify exhaustively. The cases worth checking: roll-over at 9.9→10.0,
-59.9→1:00.0 and 9:59:59.9→0:00:00.0; pause holding the count with no drift;
-capture during a roll-over; a sixth capture pushing the oldest lap off the end;
-`swN` priority; reset from mid-count. Speed up simulation by parameterizing the
-divider (see 4) so a tick costs tens of cycles rather than five million.
-
-**3. Count in BCD and delete the arithmetic.** Store seconds and minutes as two
-mod-10 / mod-6 digits instead of one 0–59 value. The `/ 10` and `% 10` in
-`display_stored` vanish, the digits feed `bcd_display` directly, and the carry
-chain gets simpler rather than more complex. This is the standard way these are
-built.
-
-**4. Parameterize the constants.** `2_499_999` and `999_999` should be
-`localparam DIV = CLK_HZ / 20 - 1` and `localparam DB = CLK_HZ / 50 - 1`, derived
-from a `parameter CLK_HZ = 50_000_000`. The design then ports to a 100 MHz board
-by changing one number, and a testbench can override it to something small.
-
-**5. Add a synchronizer on every asynchronous input**, and an async-assert /
-sync-deassert reset synchronizer. Both are three-line modules and both are things
-a reviewer will look for.
-
-**6. Pack the port lists into vectors.** `sw0..sw4` becomes `input [4:0] sw`, and
-the twenty `*_prevN` wires become four flat buses (`[19:0] hrs_laps`, and so on)
-sliced with `hrs_laps[4*i +: 4]`. The `display_stored` mux collapses from a
-30-line `if/else if` chain to a `case` over a priority-encoded index, and the
-top-level instantiation loses about forty lines of port connections. Verilog-2001
-cannot pass unpacked arrays through ports; flat vectors are the portable way, or
-move to SystemVerilog and use real arrays.
-
-**7. Make start/stop a proper toggle.** Debounce `sw_start` with the same
-debouncer already written for `sw_capture`, edge-detect it, and flip a `running`
-register on each press. Then it works with a push-button, which is what a
-stopwatch actually wants. Factoring the debouncer out of `storage_values` into
-its own reusable module is the enabling step.
-
-**8. Add a separate lap-clear**, and a second-digit for hours with an overflow
-flag so a wrap is visible.
-
-**9. Show which lap is being displayed.** With `sw0..sw4` collapsed to a bus,
-the index is already computed — putting it on a spare LED or blanking a digit to
-mark "this is history, not live" removes the ambiguity of looking at a frozen
-display.
-
-**10. Board plumbing.** A pin-assignment file, a `.qsf`/constraints file, and a
-top-level wrapper naming the real board signals (`MAX10_CLK1_50`, `KEY[0]`,
-`SW[9:0]`, `HEX0..HEX5`) so the project builds without manual pin entry.
+- **Simulation only.** No FPGA bring-up, no timing closure, no scope traces. The
+  board wrapper elaborates and lints; it has never been on a board. The
+  flip-flop count is a hand count, not a synthesis report.
+- **Stop is still quantized to 100 ms.** The displayed value is the number of
+  *completed* tenths, so the true elapsed time is somewhere in a 100 ms band
+  above it. Start no longer has this error, since the start press re-phases the
+  divider; stop inherently does.
+- **Both buttons carry a 20 ms debounce latency.** This mostly cancels for
+  interval measurement -- start and stop are delayed equally, so the *duration*
+  is unaffected -- but the stopwatch does lag the physical press.
+- **Hours is still one digit**, wrapping at 10 hours. `overflow` makes the wrap
+  visible, but a second hours digit needs a seventh display and the target boards
+  have six.
+- **`LAP_DEPTH` is capped at 8** by the 3-bit `view_index` port, and in practice
+  by needing one switch per slot. A deeper stack would want a browse button and
+  an index display instead of one switch each.
+- **Laps are absolute times, not splits.** No subtraction, so lap-to-lap deltas
+  are left to the reader.
+- **Oldest laps still fall off the end silently.** That is the intended behavior
+  of a fixed-depth stack, not an oversight, but nothing signals the loss.
+- **Synchronizers reduce metastability, they do not eliminate it.** Two stages at
+  50 MHz is the ordinary engineering answer, not a proof.
+- **`clr` while running zeroes and keeps counting.** That is a choice -- it makes
+  `clr` a restart rather than a stop. For stop-and-zero, press start/stop first.
 
 ## Repo layout
 
 ```
 stopwatch/
-  rtl/    stopwatch_draft.v    all five modules
+  rtl/      reset_sync.v  sync2.v  debounce.v  tick_gen.v  time_counter.v
+            lap_store.v   display_mux.v  seg_decode.v  stopwatch_top.v
+  boards/   de10_lite.v
+  tb/       tb_time_counter.v  tb_debounce.v  tb_lap_store.v
+            tb_no_reset.v  tb_stopwatch_top.v  tb_v1_phantom_lap.v
+  sim/      Makefile
+  docs/     stopwatch_draft_v1.v      the original, kept for `make bug`
   README.md
 ```
-
-The five modules currently share one file. Splitting them one-per-file — as
-`clock_divider.v`, `time_counter.v`, `lap_store.v`, `display_mux.v`,
-`seg_decode.v` — is worth doing alongside improvement 6, since that is the edit
-that touches every port list anyway.
