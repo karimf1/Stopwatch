@@ -4,9 +4,6 @@ A 0.1-second-resolution stopwatch in Verilog-2001, driving six seven-segment
 displays directly, with a five-deep lap stack you can page back through while the
 clock keeps running.
 
-Nine modules, 589 lines of RTL, one clock domain, no vendor IP and no
-SystemVerilog. Simulated with Icarus Verilog: 803 lines of testbench, including
-an exhaustive walk over all 360,000 tenths of the counter's range.
 
 ```
    +---+     +---+---+     +---+---+     +---+
@@ -18,23 +15,6 @@ an exhaustive walk over all 360,000 tenths of the counter's range.
 
 Range is `0:00:00.0` to `9:59:59.9`, then it wraps and latches a sticky
 `overflow` flag so the wrap is visible rather than silent.
-
-## Quickstart
-
-```bash
-brew install icarus-verilog
-```
-
-```bash
-make -C sim
-```
-
-That lints the RTL and the board wrapper, then runs all five testbenches. Each
-prints `TEST PASSED` or the build exits nonzero.
-
-```bash
-make -C sim bug
-```
 
 ## Controls
 
